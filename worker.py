@@ -4,6 +4,9 @@ from config import CONN, BACKOFF_BASE, BACKOFF_CAP
 import os, socket
 import random
 
+class PermanentError(Exception):
+    pass
+
 def handle_sleep(payload):
     time.sleep(payload["seconds"])
     return "done sleeping"
@@ -22,7 +25,7 @@ def handler(job_type, payload):
     if job_type in HANDLERS:
         return HANDLERS[job_type](payload)
     else:
-        raise ValueError(f"unknown job type: {job_type}")
+        raise PermanentError(f"Unknown job type: {job_type}")
 
 if __name__ == "__main__":
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
@@ -50,8 +53,12 @@ if __name__ == "__main__":
                 continue
         
             print("running job", job_id)
+            permanent = False
             try:
                 success, message = True, handler(job_type, payload)
+            except PermanentError as e:
+                success, message = False, str(e)
+                permanent = True
             except Exception as e:
                 success, message = False, str(e)
 
@@ -62,7 +69,7 @@ if __name__ == "__main__":
                             "UPDATE jobs SET status = 'done' WHERE id = %s",
                             (job_id,),
                         )
-                    elif attempts < max_attempts:
+                    elif attempts < max_attempts and not permanent:
                         backoff = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** attempts)) * random.uniform(0.5, 1.5)
                         cur.execute(
                             "UPDATE jobs SET status = 'queued', run_at = now()+make_interval(secs => %s), error = %s WHERE id = %s",
