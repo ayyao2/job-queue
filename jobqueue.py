@@ -13,4 +13,4 @@ def enqueue(job_type, payload):
 
 if __name__ == "__main__":
     for i in range(20):
-        print("enqueued job", enqueue("sleep_job", {"seconds": 2}))
+        print("enqueued job", enqueue("flaky_job", {"seconds": 2}))

@@ -6,7 +6,11 @@ CREATE TABLE jobs (
     job_type   TEXT NOT NULL,
     payload    JSONB NOT NULL,
     status     TEXT NOT NULL DEFAULT 'queued',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attempts   INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 5,
+    run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    error TEXT
 );
 
 CREATE TABLE executions (

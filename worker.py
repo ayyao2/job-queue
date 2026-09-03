@@ -1,12 +1,26 @@
 import psycopg
 import time
-from config import CONN
+from config import CONN, BACKOFF_BASE, BACKOFF_CAP
 import os, socket
+import random
+
+def handle_sleep(payload):
+    time.sleep(payload["seconds"])
+    return "done sleeping"
+
+def handle_flaky(payload):
+    if random.random() < 0.3:
+        raise RuntimeError("flaky job failed")
+    return "flaky job succeeded"
+
+HANDLERS = {
+    "sleep_job": handle_sleep,
+    "flaky_job": handle_flaky,
+}
 
 def handler(job_type, payload):
-    if job_type == "sleep_job":
-        time.sleep(payload["seconds"])
-        return "done sleeping"
+    if job_type in HANDLERS:
+        return HANDLERS[job_type](payload)
     else:
         raise ValueError(f"unknown job type: {job_type}")
 
@@ -17,32 +31,46 @@ if __name__ == "__main__":
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE jobs SET status = 'running' WHERE id = ("
-                        "  SELECT id FROM jobs WHERE status = 'queued'"
+                        "UPDATE jobs SET status = 'running', attempts = attempts + 1 WHERE id = ("
+                        "  SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now()"
                         "  ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
-                        ") RETURNING id, job_type, payload"
+                        ") RETURNING id, job_type, payload, attempts, max_attempts"
                     )
                     row = cur.fetchone()
                     if row is not None:
-                        job_id, job_type, payload = row
+                        job_id, job_type, payload, attempts, max_attempts = row
                         cur.execute(
                             "INSERT INTO executions (job_id, worker_id) VALUES (%s, %s)",
                             (job_id, worker_id),
                         )
+                        
+
             if row is None:
                 time.sleep(1)
                 continue
-
+        
             print("running job", job_id)
             try:
-                status, message = "done", handler(job_type, payload)
+                success, message = True, handler(job_type, payload)
             except Exception as e:
-                status, message = "failed", f"job failed: {e}"
+                success, message = False, str(e)
 
             with conn.transaction():
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE jobs SET status = %s WHERE id = %s",
-                        (status, job_id),
-                    )
+                    if success:
+                        cur.execute(
+                            "UPDATE jobs SET status = 'done' WHERE id = %s",
+                            (job_id,),
+                        )
+                    elif attempts < max_attempts:
+                        backoff = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** attempts)) * random.uniform(0.5, 1.5)
+                        cur.execute(
+                            "UPDATE jobs SET status = 'queued', run_at = now()+make_interval(secs => %s), error = %s WHERE id = %s",
+                            (backoff, message, job_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE jobs SET status = 'dead', error = %s WHERE id = %s",
+                            (message, job_id),
+                        )
             print(message, job_id)
