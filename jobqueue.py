@@ -12,5 +12,4 @@ def enqueue(job_type, payload):
             return cur.fetchone()[0]
 
 if __name__ == "__main__":
-    for i in range(20):
-        print("enqueued job", enqueue("flaky_job", {"seconds": 2}))
+    enqueue("sleep_job", {"seconds": 6})

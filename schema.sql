@@ -10,6 +10,8 @@ CREATE TABLE jobs (
     attempts   INT NOT NULL DEFAULT 0,
     max_attempts INT NOT NULL DEFAULT 5,
     run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    locked_until TIMESTAMPTZ,
+    locked_by TEXT,
     error TEXT
 );
 
