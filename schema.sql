@@ -1,5 +1,7 @@
 DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS executions;
+DROP TABLE IF EXISTS side_effects;
+DROP TABLE IF EXISTS job_completions;
 
 CREATE TABLE jobs (
     id         BIGSERIAL PRIMARY KEY,
@@ -18,5 +20,17 @@ CREATE TABLE jobs (
 CREATE TABLE executions (
     job_id BIGINT NOT NULL,
     worker_id TEXT, 
+    at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE side_effects (
+    id BIGSERIAL PRIMARY KEY,
+    job_id BIGINT NOT NULL,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE job_completions (
+    job_id BIGINT PRIMARY KEY,
     at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

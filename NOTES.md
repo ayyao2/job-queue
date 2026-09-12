@@ -41,3 +41,11 @@ docker compose exec db psql -U postgres -d jobs
     - Relies on whatever the handler calls to timeout when it hangs. 
     - Generally, LOCK_TIMEOUT >= 3 * HEARTBEAT_INTERVAL so one missed heartbeat is ok.
 
+- Exactly-once delivery is not possible. The side effect and the acknowledgement of the side effect are two separate commits. 
+    - If the side effect comes first and then the ack, a crash in-between means the effect happened but was not recognized, so the job looks unfinished and is rerun.
+    - If the ack comes first and then the side effect, then a crash means that the job looks done and the effect was never done, so work was lost silently. 
+    - The queue cannot solve the problem. It can only make the claim and status write atomic, but not the handler's writes b/c it doesn't know what the handler is/does. 
+    - The handler needs to insert a completion marker by job_id in the same transaction as the effect. This means it will happen atomically. 
+    - We can detect reruns by catching the primary key violation. If we just read/select jobs that aren't done, we may have a race, as two workers will read not done, and both complete the side effect.
+    - Thus, queue promises that jobs are attempted at least once, and handler promises work happens at most once. Thus, effectively once. 
+        - This only works for effects that can be made transactional. If not possible, we can send an idempotency key downstream (job_id). 

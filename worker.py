@@ -8,23 +8,51 @@ import threading
 class PermanentError(Exception):
     pass
 
-def handle_sleep(payload):
+def handle_sleep(job_id, payload):
     time.sleep(payload["seconds"])
     return "done sleeping"
 
-def handle_flaky(payload):
+def handle_flaky(job_id, payload):
     if random.random() < 0.3:
         raise RuntimeError("flaky job failed")
     return "flaky job succeeded"
 
+def handle_side_effect_unsafe(job_id, payload):
+    with psycopg.connect(CONN) as conn:
+        conn.execute(
+            "INSERT INTO side_effects (job_id, note) VALUES (%s, %s)",
+            (job_id, payload["note"])
+        )
+    time.sleep(payload["seconds"])
+    return "effect written"
+
+def handle_side_effect_safe(job_id, payload):
+    with psycopg.connect(CONN) as conn:
+        try:
+            with conn.transaction():
+                conn.execute(
+                    "INSERT INTO job_completions (job_id) VALUES (%s)",
+                    (job_id,)
+                )
+                conn.execute(
+                    "INSERT INTO side_effects (job_id, note) VALUES (%s, %s)",
+                    (job_id, payload["note"])
+                )
+        except psycopg.errors.UniqueViolation:
+            return "already done, skipped"
+    time.sleep(payload["seconds"])
+    return "effect written"
+
 HANDLERS = {
     "sleep_job": handle_sleep,
     "flaky_job": handle_flaky,
+    "side_effect_unsafe": handle_side_effect_unsafe,
+    "side_effect_safe": handle_side_effect_safe,
 }
 
-def handler(job_type, payload):
+def handler(job_id, job_type, payload):
     if job_type in HANDLERS:
-        return HANDLERS[job_type](payload)
+        return HANDLERS[job_type](job_id, payload)
     else:
         raise PermanentError(f"Unknown job type: {job_type}")
 
@@ -94,7 +122,7 @@ if __name__ == "__main__":
             hb = threading.Thread(target=heartbeat, args=(job_id, worker_id, stop), daemon=True)
             hb.start()
             try:
-                success, message = True, handler(job_type, payload)
+                success, message = True, handler(job_id, job_type, payload)
             except PermanentError as e:
                 success, message = False, str(e)
                 permanent = True

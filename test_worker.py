@@ -33,7 +33,7 @@ def wait_for_jobs_to_finish(timeout):
 def reset_db():
     with psycopg.connect(CONN) as conn:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE jobs, executions RESTART IDENTITY")
+            cur.execute("TRUNCATE jobs, executions, side_effects, job_completions RESTART IDENTITY")
     yield
 
 @pytest.fixture
@@ -229,3 +229,41 @@ def test_heartbeat_stops_when_worker_dies(manual_workers):
     assert status == "running", f"Expected the reclaimed job to be running, got {status}"
     assert locked_by != first_worker, "Job was reclaimed by the worker that died"
     assert execution_count(job_id) == 2, "Expected the reclaim to log a 2nd execution"
+
+def side_effect_count(job_id):
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM side_effects WHERE job_id = %s", (job_id,))
+            return cur.fetchone()[0]
+
+def kill_after_side_effect(job_type, manual_workers):
+    job_id = enqueue(job_type, {"note": "charge", "seconds": 2 * LOCK_TIMEOUT})
+    victim = start_workers(1)[0]
+    manual_workers.append(victim)
+    wait_until(
+        lambda: side_effect_count(job_id) == 1,
+        20,
+        f"{job_type} never wrote its side effect",
+    )
+    victim.kill()
+    victim.wait()
+
+    manual_workers.extend(start_workers(1))
+    wait_for_job(job_id, ("done",), 8 * LOCK_TIMEOUT + 30)
+    return job_id
+
+def test_unsafe_handler_duplicates_side_effect(manual_workers):
+    job_id = kill_after_side_effect("side_effect_unsafe", manual_workers)
+
+    assert execution_count(job_id) == 2, "Expected the job to run twice"
+    effects = side_effect_count(job_id)
+    assert effects == 2, f"Expected the duplicate effect to be demonstrated, got {effects}"
+
+def test_safe_handler_absorbs_duplicate(manual_workers):
+    job_id = kill_after_side_effect("side_effect_safe", manual_workers)
+
+    assert execution_count(job_id) == 2, "Expected the job to run twice"
+    attempts = job_row(job_id)[1]
+    assert attempts == 2, f"Expected the reclaim to count as a 2nd attempt, got {attempts}"
+    effects = side_effect_count(job_id)
+    assert effects == 1, f"Effect should have happened exactly once, got {effects}"
