@@ -1,6 +1,6 @@
 import pytest
 import psycopg
-from config import CONN
+from config import CONN, LOCK_TIMEOUT
 from jobqueue import enqueue
 import time
 import sys
@@ -83,3 +83,87 @@ def test_unknown_job_type(workers):
             assert status == "dead", f"Expected status 'dead', got {status}"
             assert attempts == 1, f"Expected 1 attempt, got {attempts}"
             assert "Unknown job type" in error, f"Expected error message about unknown job type, got {error}"
+
+def wait_for_job(job_id, statuses, timeout):
+    deadline = time.time() + timeout
+    status = None
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            while time.time() < deadline:
+                cur.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
+                status = cur.fetchone()[0]
+                if status in statuses:
+                    return status
+                time.sleep(0.2)
+    raise TimeoutError(f"Job {job_id} never reached {statuses}, last status {status}")
+
+def seed_running_job(attempts, max_attempts, locked_until_offset):
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jobs (job_type, payload, status, attempts, max_attempts, locked_until, locked_by) "
+                "VALUES ('sleep_job', '{\"seconds\": 0}', 'running', %s, %s, now() + make_interval(secs => %s), 'dead-worker') "
+                "RETURNING id",
+                (attempts, max_attempts, locked_until_offset),
+            )
+            return cur.fetchone()[0]
+
+@pytest.fixture
+def manual_workers(reset_db):
+    procs = []
+    yield procs
+    for p in procs:
+        p.terminate()
+        p.wait()
+
+def test_killed_worker_job_reclaimed(manual_workers):
+    # A job whose worker is SIGKILLed mid-run stays 'running' until its lock
+    # expires, then another worker must reclaim it and finish it.
+    job_id = enqueue("sleep_job", {"seconds": LOCK_TIMEOUT * 0.6})
+    victim = start_workers(1)[0]
+    wait_for_job(job_id, ("running",), 10)
+    victim.kill()
+    victim.wait()
+
+    manual_workers.extend(start_workers(1))
+    wait_for_job(job_id, ("done",), 4 * LOCK_TIMEOUT + 20)
+
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT attempts FROM jobs WHERE id = %s", (job_id,))
+            attempts = cur.fetchone()[0]
+            assert attempts == 2, f"Expected the reclaim to count as a 2nd attempt, got {attempts}"
+            cur.execute("SELECT COUNT(*) FROM executions WHERE job_id = %s", (job_id,))
+            executions = cur.fetchone()[0]
+            assert executions == 2, f"Expected 2 executions, got {executions}"
+
+def test_expired_lock_with_exhausted_attempts_goes_dead(manual_workers):
+    # An orphaned 'running' job that has already used up its attempts must not
+    # be reclaimed forever -- it gets swept into 'dead'.
+    job_id = seed_running_job(attempts=5, max_attempts=5, locked_until_offset=-1)
+    manual_workers.extend(start_workers(1))
+    wait_for_job(job_id, ("dead",), 20)
+
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT attempts, error FROM jobs WHERE id = %s", (job_id,))
+            attempts, error = cur.fetchone()
+            assert attempts == 5, f"Sweep should not consume an attempt, got {attempts}"
+            assert "exceeded max attempts" in error, f"Unexpected error message: {error}"
+            cur.execute("SELECT COUNT(*) FROM executions WHERE job_id = %s", (job_id,))
+            assert cur.fetchone()[0] == 0, "Swept job should never have been executed"
+
+def test_live_lock_is_not_stolen(manual_workers):
+    # A job held by a healthy worker (lock still in the future) must be left
+    # alone by both the reclaim query and the dead sweep.
+    job_id = seed_running_job(attempts=1, max_attempts=5, locked_until_offset=60)
+    manual_workers.extend(start_workers(5))
+    time.sleep(2 * LOCK_TIMEOUT)
+
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, attempts, locked_by FROM jobs WHERE id = %s", (job_id,))
+            status, attempts, locked_by = cur.fetchone()
+            assert status == "running", f"Expected job to stay 'running', got {status}"
+            assert attempts == 1, f"Expected attempts to stay 1, got {attempts}"
+            assert locked_by == "dead-worker", f"Job was stolen by {locked_by}"

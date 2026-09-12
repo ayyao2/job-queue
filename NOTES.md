@@ -29,3 +29,12 @@ docker compose exec db psql -U postgres -d jobs
 
 - Define permanent and retryable errors, so permanent errors like a handler not existing don't cause retries. That problem won't get fixed by retrying.
     - Make retry the default. 
+
+- If a worker dies while executing a job, the job will remain marked as "running" in the table forever. 
+    - Use a "locked_until" column so that workers can claim jobs that are running but past their locked_until time. 
+    - Reclaimed jobs will increment attempts again.
+    - Need to ensure that we set status to dead if attempts >= max_attempts. This doesn't just occur when the job fails now. 
+    - The problem is when the job takes longer than LOCK_TIMEOUT. Then, two workers may handle a job at the same time, once the first worker has exceed the lockout time. 
+
+
+

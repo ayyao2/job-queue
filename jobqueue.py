@@ -12,4 +12,4 @@ def enqueue(job_type, payload):
             return cur.fetchone()[0]
 
 if __name__ == "__main__":
-    enqueue("sleep_job", {"seconds": 6})
+    enqueue("sleep_job", {"seconds": 10})

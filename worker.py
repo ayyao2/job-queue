@@ -35,7 +35,7 @@ if __name__ == "__main__":
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + make_interval(secs => %s), locked_by = %s WHERE id = ("
-                        "  SELECT id FROM jobs WHERE (status = 'queued' AND run_at <= now()) OR (status = 'running' AND locked_until <= now())"
+                        "  SELECT id FROM jobs WHERE (status = 'queued' AND run_at <= now()) OR (status = 'running' AND locked_until <= now() AND attempts < max_attempts)"
                         "  ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
                         ") RETURNING id, job_type, payload, attempts, max_attempts",
                         (LOCK_TIMEOUT, worker_id),
@@ -50,6 +50,11 @@ if __name__ == "__main__":
                         
 
             if row is None:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE jobs SET status = 'dead', error = 'exceeded max attempts' WHERE status = 'running' AND locked_until <= now() AND attempts >= max_attempts"
+                        )
                 time.sleep(1)
                 continue
         
