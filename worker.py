@@ -1,8 +1,9 @@
 import psycopg
 import time
-from config import CONN, BACKOFF_BASE, BACKOFF_CAP, LOCK_TIMEOUT
+from config import CONN, BACKOFF_BASE, BACKOFF_CAP, LOCK_TIMEOUT, HEARTBEAT_INTERVAL
 import os, socket
 import random
+import threading
 
 class PermanentError(Exception):
     pass
@@ -26,6 +27,16 @@ def handler(job_type, payload):
         return HANDLERS[job_type](payload)
     else:
         raise PermanentError(f"Unknown job type: {job_type}")
+
+def heartbeat(job_id, worker_id, stop):
+    with psycopg.connect(CONN) as conn:
+        while not stop.wait(HEARTBEAT_INTERVAL):
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE jobs SET locked_until = now() + make_interval(secs => %s) WHERE id = %s AND locked_by = %s",
+                        (LOCK_TIMEOUT, job_id, worker_id),
+                    )
 
 if __name__ == "__main__":
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
@@ -60,6 +71,9 @@ if __name__ == "__main__":
         
             print("running job", job_id)
             permanent = False
+            stop = threading.Event()
+            hb = threading.Thread(target=heartbeat, args=(job_id, worker_id, stop), daemon=True)
+            hb.start()
             try:
                 success, message = True, handler(job_type, payload)
             except PermanentError as e:
@@ -67,23 +81,26 @@ if __name__ == "__main__":
                 permanent = True
             except Exception as e:
                 success, message = False, str(e)
+            finally:
+                stop.set()
+                hb.join()
 
             with conn.transaction():
                 with conn.cursor() as cur:
                     if success:
                         cur.execute(
-                            "UPDATE jobs SET status = 'done' WHERE id = %s",
-                            (job_id,),
+                            "UPDATE jobs SET status = 'done' WHERE id = %s AND locked_by = %s",
+                            (job_id, worker_id),
                         )
                     elif attempts < max_attempts and not permanent:
                         backoff = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** attempts)) * random.uniform(0.5, 1.5)
                         cur.execute(
-                            "UPDATE jobs SET status = 'queued', run_at = now()+make_interval(secs => %s), error = %s WHERE id = %s",
-                            (backoff, message, job_id),
+                            "UPDATE jobs SET status = 'queued', run_at = now()+make_interval(secs => %s), error = %s WHERE id = %s AND locked_by = %s",
+                            (backoff, message, job_id, worker_id),
                         )
                     else:
                         cur.execute(
-                            "UPDATE jobs SET status = 'dead', error = %s WHERE id = %s",
-                            (message, job_id),
+                            "UPDATE jobs SET status = 'dead', error = %s WHERE id = %s AND locked_by = %s",
+                            (message, job_id, worker_id),
                         )
             print(message, job_id)

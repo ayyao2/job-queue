@@ -1,6 +1,6 @@
 import pytest
 import psycopg
-from config import CONN, LOCK_TIMEOUT
+from config import CONN, LOCK_TIMEOUT, HEARTBEAT_INTERVAL
 from jobqueue import enqueue
 import time
 import sys
@@ -120,7 +120,10 @@ def test_killed_worker_job_reclaimed(manual_workers):
     # A job whose worker is SIGKILLed mid-run stays 'running' until its lock
     # expires, then another worker must reclaim it and finish it.
     job_id = enqueue("sleep_job", {"seconds": LOCK_TIMEOUT * 0.6})
+    # Register the victim with the fixture before anything that can raise, or a
+    # timeout here leaks a live worker into every test that follows.
     victim = start_workers(1)[0]
+    manual_workers.append(victim)
     wait_for_job(job_id, ("running",), 10)
     victim.kill()
     victim.wait()
@@ -167,3 +170,62 @@ def test_live_lock_is_not_stolen(manual_workers):
             assert status == "running", f"Expected job to stay 'running', got {status}"
             assert attempts == 1, f"Expected attempts to stay 1, got {attempts}"
             assert locked_by == "dead-worker", f"Job was stolen by {locked_by}"
+
+def job_row(job_id):
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, attempts, locked_by, locked_until FROM jobs WHERE id = %s",
+                (job_id,),
+            )
+            return cur.fetchone()
+
+def execution_count(job_id):
+    with psycopg.connect(CONN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM executions WHERE job_id = %s", (job_id,))
+            return cur.fetchone()[0]
+
+def wait_until(predicate, timeout, message):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.2)
+    raise TimeoutError(message)
+
+def test_long_job_not_reclaimed(manual_workers):
+    job_id = enqueue("sleep_job", {"seconds": 4 * LOCK_TIMEOUT})
+    manual_workers.extend(start_workers(3))
+    wait_for_job(job_id, ("done",), 8 * LOCK_TIMEOUT + 20)
+
+    attempts = job_row(job_id)[1]
+    assert attempts == 1, f"Expected a single claim, got {attempts} attempts"
+    executions = execution_count(job_id)
+    assert executions == 1, f"Job ran more than once: {executions} executions"
+
+def test_heartbeat_stops_when_worker_dies(manual_workers):
+    job_id = enqueue("sleep_job", {"seconds": 10 * LOCK_TIMEOUT})
+    victim = start_workers(1)[0]
+    manual_workers.append(victim)
+    wait_for_job(job_id, ("running",), 10)
+
+    claimed_until = job_row(job_id)[3]
+    time.sleep(4 * HEARTBEAT_INTERVAL)
+    _, _, first_worker, renewed_until = job_row(job_id)
+    assert renewed_until > claimed_until, "Heartbeat never extended locked_until"
+
+    victim.kill()
+    victim.wait()
+
+    manual_workers.extend(start_workers(1))
+    wait_until(
+        lambda: job_row(job_id)[1] == 2,
+        4 * LOCK_TIMEOUT + 20,
+        "Job was never reclaimed -- the lock outlived the worker that held it",
+    )
+
+    status, _, locked_by, _ = job_row(job_id)
+    assert status == "running", f"Expected the reclaimed job to be running, got {status}"
+    assert locked_by != first_worker, "Job was reclaimed by the worker that died"
+    assert execution_count(job_id) == 2, "Expected the reclaim to log a 2nd execution"

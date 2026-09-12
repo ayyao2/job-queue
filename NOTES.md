@@ -36,5 +36,8 @@ docker compose exec db psql -U postgres -d jobs
     - Need to ensure that we set status to dead if attempts >= max_attempts. This doesn't just occur when the job fails now. 
     - The problem is when the job takes longer than LOCK_TIMEOUT. Then, two workers may handle a job at the same time, once the first worker has exceed the lockout time. 
 
-
+- Heartbeat solves the issue of a static locked_until value by updating it periodically with a background thread. 
+    - Proves that the process is alive, but not necessarily that the work is progressing.
+    - Relies on whatever the handler calls to timeout when it hangs. 
+    - Generally, LOCK_TIMEOUT >= 3 * HEARTBEAT_INTERVAL so one missed heartbeat is ok.
 
