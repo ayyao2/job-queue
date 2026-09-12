@@ -29,14 +29,33 @@ def handler(job_type, payload):
         raise PermanentError(f"Unknown job type: {job_type}")
 
 def heartbeat(job_id, worker_id, stop):
-    with psycopg.connect(CONN) as conn:
+    conn = None
+    try:
         while not stop.wait(HEARTBEAT_INTERVAL):
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE jobs SET locked_until = now() + make_interval(secs => %s) WHERE id = %s AND locked_by = %s",
-                        (LOCK_TIMEOUT, job_id, worker_id),
-                    )
+            try:
+                if conn is None or conn.closed:
+                    conn = psycopg.connect(CONN)
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE jobs SET locked_until = now() + make_interval(secs => %s) "
+                            "WHERE id = %s AND locked_by = %s",
+                            (LOCK_TIMEOUT, job_id, worker_id),
+                        )
+            except Exception as e:
+                print(f"heartbeat failed for job {job_id}: {e}")
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
